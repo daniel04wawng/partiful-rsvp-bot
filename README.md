@@ -5,7 +5,7 @@ to go to. Originally built to handle Tech Week's ~1500-event calendars without
 hand-clicking every one.
 
 ```bash
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --types "AI, founder breakfasts, VC drinks"
 ```
@@ -35,17 +35,25 @@ infinite-scroll calendar of Partiful URLs and it'll do the rest.
 
 ## Setup (~5 min, one-time)
 
-### 1. Install Python deps
+### 1. Install
 
 ```bash
-pip install playwright
+pipx install partiful-rsvp
 playwright install chromium
+```
+
+(or `pip install partiful-rsvp` if you don't have pipx)
+
+For the optional semantic-matching mode:
+
+```bash
+pipx install "partiful-rsvp[llm]"
 ```
 
 ### 2. Log in to Partiful
 
 ```bash
-python3 rsvp_bot.py login
+partiful-rsvp login
 ```
 
 Opens Chrome. Sign in with your phone + SMS as normal. When you see your home
@@ -59,14 +67,14 @@ feed, return to the terminal and hit ENTER. Your session is saved to
 ### Simple — RSVP to everything on a calendar
 
 ```bash
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc
 ```
 
 ### Filter by event type (keyword mode, free)
 
 ```bash
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --types "AI, founders, VC, drinks, breakfast"
 ```
@@ -79,7 +87,7 @@ brand names, tech topics, event formats.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --types "founder breakfasts, intimate VC dinners, AI agent workshops. Skip yoga or wellness." \
   --llm
@@ -96,7 +104,7 @@ Cost: ~$0.001 per event judged, so $1-2 for a 1500-event calendar.
 Always test on a small batch before letting it loose:
 
 ```bash
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --types "AI, founders" \
   --dry-run --headed --max 5

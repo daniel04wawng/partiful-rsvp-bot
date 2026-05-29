@@ -6,7 +6,7 @@ This is how you'd use the bot to RSVP to just the ones you actually want.
 ## 1. Discover what's on the calendar
 
 ```bash
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --dry-run --headed --max 10
 ```
@@ -22,7 +22,7 @@ Run the actual filter. A few examples:
 ### Founder breakfasts only
 
 ```bash
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --types "founders breakfast, founder coffee, founder lunch"
 ```
@@ -30,7 +30,7 @@ python3 rsvp_bot.py rsvp \
 ### AI / agent topics
 
 ```bash
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --types "AI, agents, LLM, agentic, foundation models"
 ```
@@ -39,7 +39,7 @@ python3 rsvp_bot.py rsvp \
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --types "Events for early-stage founders raising seed or series A. Prefer demos and pitch nights. Skip yoga, runs, wellness, or non-tech parties." \
   --llm
@@ -56,7 +56,7 @@ have 50-150 matches. At 30-60s delays that's ~1-3 hours wall time, so just
 let it run while you sleep.
 
 ```bash
-python3 rsvp_bot.py rsvp \
+partiful-rsvp rsvp \
   --calendar https://www.tech-week.com/calendar/nyc \
   --types "..." \
   --delay 30 --jitter 30

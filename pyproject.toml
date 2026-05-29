@@ -1,0 +1,46 @@
+[project]
+name = "partiful-rsvp"
+version = "0.1.0"
+description = "Auto-RSVP to Partiful events that match the kinds you describe in plain English."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+  { name = "Daniel Wang" },
+]
+requires-python = ">=3.9"
+keywords = ["partiful", "rsvp", "tech-week", "playwright", "automation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
+dependencies = [
+  "playwright>=1.45",
+]
+
+[project.optional-dependencies]
+# Semantic event matching with --llm. Bring your own ANTHROPIC_API_KEY.
+llm = ["anthropic>=0.40"]
+
+[project.urls]
+Homepage = "https://github.com/daniel04wawng/partiful-rsvp-bot"
+Repository = "https://github.com/daniel04wawng/partiful-rsvp-bot"
+Issues = "https://github.com/daniel04wawng/partiful-rsvp-bot/issues"
+
+[project.scripts]
+# After `pipx install partiful-rsvp` users get a `partiful-rsvp` command.
+partiful-rsvp = "partiful_rsvp.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
