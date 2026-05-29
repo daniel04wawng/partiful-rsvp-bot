@@ -354,21 +354,54 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
 
     name_filled, phone_filled = False, False
     if name:
-        for sel in ("input[placeholder*='Name' i]",
-                    "input[placeholder*='your name' i]",
-                    "input[name='name' i]",
-                    "input[aria-label*='Name' i]",
-                    "[contenteditable] >> nth=0"):
+        # Partiful's name field looks like a styled div, not a real <input>.
+        # Try the obvious selectors first; if none match, fall back to typing
+        # into whichever visible input isn't the phone field.
+        attempted = [
+            "input[placeholder*='Name' i]",
+            "input[placeholder*='your name' i]",
+            "input[name='name' i]",
+            "input[aria-label*='Name' i]",
+            "[contenteditable='true']",
+        ]
+        for sel in attempted:
             try:
                 inp = page.locator(sel).first
-                if await inp.is_visible(timeout=1500):
-                    cur = (await inp.input_value()) or ""
+                if await inp.is_visible(timeout=1200):
+                    try:
+                        cur = (await inp.input_value()) or ""
+                    except Exception:
+                        cur = (await inp.inner_text()) or ""
                     if not cur.strip():
-                        await inp.fill(name, timeout=2000)
+                        try:
+                            await inp.fill(name, timeout=1500)
+                        except Exception:
+                            # contenteditable / styled-div fields ignore fill;
+                            # focus + keyboard.type is the reliable fallback.
+                            await inp.click(timeout=1500)
+                            await page.keyboard.type(name, delay=30)
                     name_filled = True
                     break
             except Exception:
                 continue
+        # Last-resort fallback: first visible text-ish input that isn't the
+        # phone one. Partiful's modal layout is consistent — name is first,
+        # phone is second.
+        if not name_filled:
+            try:
+                inputs = page.locator(
+                    "input:visible:not([type='tel']):not([inputmode='tel']):not([type='hidden'])"
+                )
+                first = inputs.first
+                if await first.is_visible(timeout=1500):
+                    try:
+                        await first.fill(name, timeout=1500)
+                    except Exception:
+                        await first.click(timeout=1500)
+                        await page.keyboard.type(name, delay=30)
+                    name_filled = True
+            except Exception:
+                pass
     if phone:
         for sel in ("input[type='tel']",
                     "input[placeholder*='Phone' i]",
