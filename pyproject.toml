@@ -1,6 +1,6 @@
 [project]
 name = "partiful-rsvp"
-version = "0.1.7"
+version = "0.1.8"
 description = "Auto-RSVP to Partiful events that match the kinds you describe in plain English."
 readme = "README.md"
 license = { text = "MIT" }

@@ -63,8 +63,39 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 # login
 # =========================================================================
 
+def _auto_detect_profile() -> dict:
+    """Best-effort: pull as much profile info as we can from the system
+    so the user doesn't have to type anything.
+
+      email     <- `git config user.email`
+      name      <- `git config user.name`  (fallback; Partiful localStorage wins)
+      bio       <- `gh api user --jq .bio`  (if GitHub CLI is set up)
+      linkedin  <- (no reliable auto-source; left blank)
+    """
+    import subprocess
+    out: dict = {}
+    def run(cmd: list[str]) -> Optional[str]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
+            v = (r.stdout or "").strip()
+            return v or None
+        except Exception:
+            return None
+    out["email"] = run(["git", "config", "--global", "user.email"])
+    out["name"] = run(["git", "config", "--global", "user.name"])
+    out["bio"] = run(["gh", "api", "user", "--jq", ".bio"])
+    out["github_url"] = run(["gh", "api", "user", "--jq", ".html_url"])
+    # GitHub user has a `blog` field that's sometimes a LinkedIn URL.
+    blog = run(["gh", "api", "user", "--jq", ".blog"])
+    if blog and "linkedin.com" in blog:
+        out["linkedin"] = blog
+    # Filter out empty strings / None
+    return {k: v for k, v in out.items() if v}
+
+
 async def cmd_login() -> None:
-    """Open headed Chrome to partiful.com. User logs in. We save state."""
+    """Open headed Chrome to partiful.com. User logs in. We save the
+    browser state + auto-detect profile info from git/gh."""
     if not async_playwright:
         log.error("playwright not installed. pip install playwright && playwright install chromium")
         sys.exit(1)
@@ -79,13 +110,45 @@ async def cmd_login() -> None:
         print("  - Click Sign in / Log in")
         print("  - Enter your phone, type the SMS code")
         print("  - Wait until you see your home feed")
-        print(f"  - Then return here and press ENTER to save state to")
-        print(f"    {STATE_FILE.absolute()}")
+        print("  - Then return here and press ENTER")
         print("=" * 70)
         input("Press ENTER once logged in... ")
         await context.storage_state(path=str(STATE_FILE))
         print(f"\n✓ saved login state to {STATE_FILE}")
+
+        # Pull what we can from the live Partiful session.
+        ext_name, ext_phone = await _extract_user_info(page)
         await browser.close()
+
+    # Build the profile from system sources + Partiful. No prompts.
+    auto = _auto_detect_profile()
+    profile = {
+        "name": ext_name or auto.get("name"),
+        "phone": ext_phone,
+        "email": auto.get("email"),
+        "linkedin": auto.get("linkedin"),
+        "bio": auto.get("bio"),
+    }
+    # Merge over any existing values so reruns don't blow away manual edits.
+    if PROFILE_FILE.exists():
+        try:
+            existing = json.loads(PROFILE_FILE.read_text())
+            for k, v in existing.items():
+                if v and not profile.get(k):
+                    profile[k] = v
+        except Exception:
+            pass
+    PROFILE_FILE.write_text(json.dumps(profile, indent=2))
+    print(f"\n✓ auto-detected profile saved to {PROFILE_FILE}:")
+    for k, v in profile.items():
+        mark = "✓" if v else "·"
+        print(f"  {mark} {k:10s} {v or '(none)'}")
+    missing = [k for k in ("email", "linkedin", "bio") if not profile.get(k)]
+    if missing:
+        print()
+        print(f"  Missing: {', '.join(missing)}.")
+        print(f"  Events with host questionnaires asking for those will be skipped.")
+        print(f"  To fill them in, edit {PROFILE_FILE} directly — JSON.")
 
 
 # =========================================================================
