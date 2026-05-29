@@ -217,6 +217,55 @@ def llm_match(meta: dict, user_types: str) -> tuple[bool, str]:
 
 
 # =========================================================================
+# read name + phone from the logged-in session
+# =========================================================================
+
+async def _extract_user_info(page: Page) -> tuple[Optional[str], Optional[str]]:
+    """After login, Partiful stores the user's name + phone in browser
+    localStorage under Firebase Auth keys. Pull them out so the user
+    doesn't have to type --name/--phone for every run."""
+    try:
+        await page.goto("https://partiful.com/", wait_until="domcontentloaded", timeout=20_000)
+    except Exception:
+        return (None, None)
+    # Wait briefly for client JS to hydrate localStorage.
+    await page.wait_for_timeout(1500)
+    try:
+        data = await page.evaluate("""
+          () => {
+            const out = {name: null, phone: null};
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              if (!k) continue;
+              if (k.startsWith('firebase:authUser:')) {
+                try {
+                  const v = JSON.parse(localStorage.getItem(k));
+                  if (v.phoneNumber) out.phone = v.phoneNumber;
+                  if (v.displayName) out.name = v.displayName;
+                } catch (e) {}
+              }
+              if (k.startsWith('CT_user_') || k.includes('partiful')) {
+                try {
+                  const v = JSON.parse(localStorage.getItem(k));
+                  if (v && typeof v === 'object') {
+                    if (v.phoneNumber && !out.phone) out.phone = v.phoneNumber;
+                    if (v.displayName && !out.name) out.name = v.displayName;
+                    if (v.name && !out.name) out.name = v.name;
+                  }
+                } catch (e) {}
+              }
+            }
+            return out;
+          }
+        """)
+    except Exception:
+        return (None, None)
+    if isinstance(data, dict):
+        return (data.get("name"), data.get("phone"))
+    return (None, None)
+
+
+# =========================================================================
 # rsvp on a single page
 # =========================================================================
 
@@ -415,6 +464,19 @@ async def cmd_rsvp(
         browser = await p.chromium.launch(headless=not headed)
         context = await browser.new_context(storage_state=str(STATE_FILE))
         page = await context.new_page()
+        # Pull name + phone from the saved login session unless the user
+        # already passed them via CLI flags.
+        if not name or not phone:
+            ext_name, ext_phone = await _extract_user_info(page)
+            if not name and ext_name:
+                name = ext_name
+                log.info("auto-extracted name from login: %s", name)
+            if not phone and ext_phone:
+                phone = ext_phone
+                log.info("auto-extracted phone from login: %s", phone)
+        if not phone:
+            log.warning("no phone found — Partiful's modal may not accept the RSVP. "
+                        "Pass --phone explicitly or re-run `partiful-rsvp login`.")
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] %s", i, len(urls), url)
             action, result = await _rsvp_one(page, url, dry_run=dry_run,
