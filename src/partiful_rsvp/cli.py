@@ -454,6 +454,65 @@ def _llm_answer_question(question: str, profile: dict, bio: Optional[str] = None
     return text.strip().strip('"').strip("'")[:200] or None
 
 
+_OTP_CODE_RE = re.compile(r"\b(\d{4,8})\b")
+
+
+def _read_recent_sms_otp(window_seconds: int = 120) -> Optional[str]:
+    """Read the most recent incoming SMS from macOS Messages.app and pull
+    a 4-8 digit OTP code from it.
+
+    Uses ~/Library/Messages/chat.db (Apple stores SMS forwarded from your
+    phone here when you're signed into iMessage on this Mac). Requires
+    Full Disk Access permission for the parent process. Returns None on
+    permission error, missing DB, no recent messages, or no code found.
+
+    This is the same approach Photon Spectrum and similar tools use to
+    consume iMessage events on Mac — there's no public Apple API for
+    third-party SMS reading."""
+    import sqlite3
+    import platform
+    if platform.system() != "Darwin":
+        return None
+    db = Path.home() / "Library/Messages/chat.db"
+    if not db.exists():
+        return None
+    try:
+        # Mac Absolute Time: seconds since 2001-01-01. chat.db stores
+        # date as nanoseconds in the newer schema, seconds in the older.
+        # The 1e9 boundary distinguishes them.
+        import time
+        mac_now_ns = (time.time() - 978_307_200) * 1_000_000_000
+        cutoff_ns = mac_now_ns - (window_seconds * 1_000_000_000)
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        cur = conn.execute(
+            "SELECT text FROM message "
+            "WHERE date > ? AND is_from_me = 0 AND text IS NOT NULL "
+            "ORDER BY date DESC LIMIT 5",
+            (cutoff_ns,),
+        )
+        for (text,) in cur.fetchall():
+            if not text:
+                continue
+            # Prefer codes that look like OTPs (4-8 digits, isolated).
+            for m in _OTP_CODE_RE.finditer(text):
+                code = m.group(1)
+                if 4 <= len(code) <= 8:
+                    return code
+        return None
+    except sqlite3.OperationalError as exc:
+        # Most common error: "authorization denied" — need Full Disk Access.
+        log.debug("chat.db read failed: %s", exc)
+        return None
+    except Exception as exc:
+        log.debug("chat.db unexpected error: %s", exc)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 _SMS_PROMPT_TOKENS = (
     "enter verification code",
     "enter the verification code",
@@ -491,7 +550,7 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
                      name: Optional[str] = None, phone: Optional[str] = None,
                      email: Optional[str] = None, linkedin: Optional[str] = None,
                      bio: Optional[str] = None, llm_answer: bool = False,
-                     pause_for_sms: bool = False,
+                     pause_for_sms: bool = False, auto_sms: bool = False,
                      debug: bool = False, timeout_ms: int = 60_000) -> tuple[str, str]:
     """RSVP to one event. If debug=True, screenshots at each stage and
     keeps the browser open longer so a human can watch."""
@@ -668,17 +727,67 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
     await page.wait_for_timeout(2_500)
 
     # Partiful sometimes inserts a fresh SMS verification step here even
-    # though we're logged in. Detect and either pause for the user to type
-    # the code in the headed browser, or skip the event.
+    # though we're logged in. Try in order:
+    #   1. --auto-sms: poll macOS Messages.app for the OTP, type it
+    #   2. --pause-for-sms: wait up to 90s for the human to type it
+    #   3. neither: skip the event with requires_sms_verification
     if await _detect_sms_prompt(page):
-        if pause_for_sms:
-            log.info("    SMS verification prompt detected — pausing 90s for you "
-                     "to type the code in the browser. Waiting...")
+        handled = False
+        if auto_sms:
+            log.info("    SMS prompt detected — polling Messages.app for OTP code...")
+            for attempt in range(20):  # up to ~60s
+                await page.wait_for_timeout(3_000)
+                code = _read_recent_sms_otp(window_seconds=180)
+                if not code:
+                    continue
+                log.info("    found OTP code %s — typing into verification field", code)
+                # Find the most likely OTP input field and fill it
+                typed = False
+                for sel in ("input[autocomplete='one-time-code']",
+                            "input[inputmode='numeric']",
+                            "input[type='tel']",
+                            "input[name*='code' i]",
+                            "input[placeholder*='code' i]",
+                            "input:visible:not([type='hidden'])"):
+                    try:
+                        inp = page.locator(sel).first
+                        if await inp.is_visible(timeout=1500):
+                            try:
+                                await inp.fill(code, timeout=2000)
+                            except Exception:
+                                await inp.click(timeout=1500)
+                                await page.keyboard.type(code, delay=40)
+                            typed = True
+                            break
+                    except Exception:
+                        continue
+                if typed:
+                    # Find a submit/continue button and click
+                    for sel in ("button:has-text('Verify')",
+                                "button:has-text('Continue')",
+                                "button:has-text('Confirm')",
+                                "button:has-text('Submit')"):
+                        try:
+                            loc = page.locator(sel).first
+                            if await loc.is_visible(timeout=1500):
+                                await loc.click(timeout=2000)
+                                break
+                        except Exception:
+                            continue
+                    await page.wait_for_timeout(2500)
+                    if not await _detect_sms_prompt(page):
+                        handled = True
+                        log.info("    SMS verified, continuing")
+                        break
+        if not handled and pause_for_sms:
+            log.info("    SMS verification prompt — pausing 90s for you to type "
+                     "the code in the browser. Waiting...")
             ok = await _wait_for_sms_resolved(page, timeout_s=90)
             if not ok:
                 return ("skip", f"sms_verification_timeout | {title[:80]}")
+            handled = True
             log.info("    SMS resolved, continuing")
-        else:
+        if not handled:
             return ("skip", f"requires_sms_verification | {title[:80]}")
 
     # Some events have a SECOND modal — host-defined questionnaire
@@ -761,6 +870,7 @@ async def cmd_rsvp(
     bio: Optional[str] = None,
     llm_answer: bool = False,
     pause_for_sms: bool = False,
+    auto_sms: bool = False,
     debug: bool = False,
 ) -> None:
     if not async_playwright:
@@ -870,6 +980,7 @@ async def cmd_rsvp(
                                               email=email, linkedin=linkedin,
                                               bio=bio, llm_answer=llm_answer,
                                               pause_for_sms=pause_for_sms,
+                                              auto_sms=auto_sms,
                                               debug=debug)
             w.writerow([datetime.now(timezone.utc).isoformat(), url, action, result])
             f.flush()
@@ -942,6 +1053,12 @@ def main() -> None:
                          "pause up to 90s for you to type it into the browser (use "
                          "with --headed). Without this flag, events that require "
                          "SMS verification are skipped.")
+    rp.add_argument("--auto-sms", action="store_true",
+                    help="(macOS only) when Partiful prompts for an SMS code, read "
+                         "the most recent Messages.app text via ~/Library/Messages/chat.db "
+                         "and type the OTP automatically. Requires Full Disk Access "
+                         "granted to your Terminal app. Falls back to --pause-for-sms "
+                         "if the read fails (no permission, empty inbox, etc).")
     rp.add_argument("--dry-run", action="store_true", help="navigate + report, don't click")
     rp.add_argument("--headed", action="store_true", help="visible browser (debugging)")
     rp.add_argument("--debug", action="store_true",
@@ -977,6 +1094,7 @@ def main() -> None:
             bio=args.bio,
             llm_answer=args.llm_answer,
             pause_for_sms=args.pause_for_sms,
+            auto_sms=args.auto_sms,
             debug=args.debug,
         ))
 
