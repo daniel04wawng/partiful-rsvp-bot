@@ -272,7 +272,9 @@ async def _extract_user_info(page: Page) -> tuple[Optional[str], Optional[str]]:
 
 async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
                      name: Optional[str] = None, phone: Optional[str] = None,
-                     timeout_ms: int = 60_000) -> tuple[str, str]:
+                     debug: bool = False, timeout_ms: int = 60_000) -> tuple[str, str]:
+    """RSVP to one event. If debug=True, screenshots at each stage and
+    keeps the browser open longer so a human can watch."""
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     except PWTimeout:
@@ -334,49 +336,75 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
 
     # Partiful opens a confirm modal with Going/Maybe/Can't Go preselected on
     # Going, plus Name + Phone fields and a Continue button. Fill what we have.
-    await page.wait_for_timeout(800)
+    await page.wait_for_timeout(1200)
+    if debug:
+        await page.screenshot(path="debug_01_modal_opened.png", full_page=True)
+
+    name_filled, phone_filled = False, False
     if name:
         for sel in ("input[placeholder*='Name' i]",
+                    "input[placeholder*='your name' i]",
                     "input[name='name' i]",
-                    "input[aria-label*='Name' i]"):
+                    "input[aria-label*='Name' i]",
+                    "[contenteditable] >> nth=0"):
             try:
                 inp = page.locator(sel).first
                 if await inp.is_visible(timeout=1500):
                     cur = (await inp.input_value()) or ""
                     if not cur.strip():
                         await inp.fill(name, timeout=2000)
+                    name_filled = True
                     break
             except Exception:
                 continue
     if phone:
-        for sel in ("input[placeholder*='Phone' i]",
+        for sel in ("input[type='tel']",
+                    "input[placeholder*='Phone' i]",
+                    "input[placeholder*='phone number' i]",
                     "input[name='phone' i]",
                     "input[aria-label*='Phone' i]",
-                    "input[type='tel']"):
+                    "input[inputmode='tel']"):
             try:
                 inp = page.locator(sel).first
                 if await inp.is_visible(timeout=1500):
                     cur = (await inp.input_value()) or ""
                     if not cur.strip():
                         await inp.fill(phone, timeout=2000)
+                    phone_filled = True
                     break
             except Exception:
                 continue
+    if debug:
+        log.info("    debug: name_filled=%s phone_filled=%s", name_filled, phone_filled)
+        await page.screenshot(path="debug_02_after_fill.png", full_page=True)
 
-    # Click confirm. 'Continue' is Partiful's modal-submit; the others cover
-    # variants on different event types.
-    for sel in ("button:has-text('Continue')", "button:has-text('Confirm')",
-                "button:has-text('RSVP')", "button:has-text('Submit')",
-                "button:has-text('Done')", "button:has-text('Save')",
+    # Click confirm. 'Continue' is Partiful's modal-submit. Try both <button>
+    # and [role=button] / div variants since Partiful uses styled divs.
+    clicked_confirm = False
+    for sel in ("button:has-text('Continue')",
+                "[role=button]:has-text('Continue')",
+                "div:has-text('Continue'):not(:has(*))",
+                "button:has-text('Confirm')",
+                "button:has-text('RSVP')",
+                "button:has-text('Submit')",
+                "button:has-text('Done')",
+                "button:has-text('Save')",
                 "button:has-text('Apply')"):
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=2_500):
                 await loc.click(timeout=3_000)
+                clicked_confirm = True
                 break
         except Exception:
             continue
-    await page.wait_for_timeout(2_500)
+    if debug:
+        log.info("    debug: clicked_confirm=%s", clicked_confirm)
+    await page.wait_for_timeout(3_000)
+    if debug:
+        await page.screenshot(path="debug_03_after_confirm.png", full_page=True)
+        log.info("    debug: holding browser open for 20s for inspection")
+        await page.wait_for_timeout(20_000)
     try:
         post_text = (await page.inner_text("body")).lower()
         if any(t in post_text for t in ("you're going", "you're attending", "you're in",
@@ -406,6 +434,7 @@ async def cmd_rsvp(
     headed: bool = False,
     name: Optional[str] = None,
     phone: Optional[str] = None,
+    debug: bool = False,
 ) -> None:
     if not async_playwright:
         log.error("playwright not installed")
@@ -504,7 +533,8 @@ async def cmd_rsvp(
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] %s", i, len(urls), url)
             action, result = await _rsvp_one(page, url, dry_run=dry_run,
-                                              name=name, phone=phone)
+                                              name=name, phone=phone,
+                                              debug=debug)
             w.writerow([datetime.now(timezone.utc).isoformat(), url, action, result])
             f.flush()
             log.info("    %s | %s", action, result)
@@ -560,6 +590,10 @@ def main() -> None:
                          "Partiful uses this for event reminders.")
     rp.add_argument("--dry-run", action="store_true", help="navigate + report, don't click")
     rp.add_argument("--headed", action="store_true", help="visible browser (debugging)")
+    rp.add_argument("--debug", action="store_true",
+                    help="save screenshots (debug_01..03_*.png), log every modal step, "
+                         "and hold the browser open 20s after Continue so you can inspect "
+                         "what landed. Use to diagnose unknown_state results.")
     rp.add_argument("--quiet", action="store_true")
 
     args = ap.parse_args()
@@ -584,6 +618,7 @@ def main() -> None:
             headed=args.headed,
             name=args.name,
             phone=args.phone,
+            debug=args.debug,
         ))
 
 
