@@ -270,8 +270,131 @@ async def _extract_user_info(page: Page) -> tuple[Optional[str], Optional[str]]:
 # rsvp on a single page
 # =========================================================================
 
+async def _fill_questionnaire(
+    page: Page, *,
+    name: Optional[str] = None,
+    phone: Optional[str] = None,
+    email: Optional[str] = None,
+    linkedin: Optional[str] = None,
+    bio: Optional[str] = None,
+    llm_answer: bool = False,
+    debug: bool = False,
+) -> str:
+    """Find all visible text fields in the second modal, match each to a
+    known piece of profile data by label keyword, fall back to LLM if
+    enabled. Returns 'filled' on success or a skip reason string."""
+    # Find all visible input/textarea elements inside the modal area.
+    field_handles = await page.locator(
+        "input:visible:not([type='hidden']):not([type='submit']), textarea:visible"
+    ).all()
+    if not field_handles:
+        return "no_fields_found"
+
+    profile = {"name": name, "phone": phone, "email": email, "linkedin": linkedin}
+    filled_count = 0
+    unfilled_required: list[str] = []
+
+    for inp in field_handles:
+        # Skip if already populated.
+        try:
+            cur = (await inp.input_value()) or ""
+            if cur.strip():
+                continue
+        except Exception:
+            pass
+
+        # Get the field's label by scanning DOM neighbours.
+        label_text = ""
+        try:
+            label_text = await inp.evaluate("""(el) => {
+              // Try aria-label, placeholder, or the nearest preceding text node.
+              let s = el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+              if (s.trim()) return s.trim();
+              // Walk up looking for sibling text or a containing block with a label.
+              let cur = el.parentElement;
+              for (let i = 0; i < 4 && cur; i++) {
+                const t = (cur.innerText || '').trim();
+                if (t && t.length < 200) return t;
+                cur = cur.parentElement;
+              }
+              return '';
+            }""")
+        except Exception:
+            pass
+        label_lower = (label_text or "").lower()
+
+        # Map label keywords to profile fields.
+        value: Optional[str] = None
+        if "linkedin" in label_lower:
+            value = linkedin
+        elif "email" in label_lower:
+            value = email
+        elif "phone" in label_lower or "mobile" in label_lower:
+            value = phone
+        elif "name" in label_lower:
+            value = name
+        elif llm_answer:
+            value = _llm_answer_question(label_text, profile, bio=bio)
+
+        if not value:
+            if "*" in label_text or "required" in label_lower:
+                unfilled_required.append(label_text[:60])
+            continue
+
+        try:
+            await inp.fill(value, timeout=1500)
+            filled_count += 1
+        except Exception:
+            try:
+                await inp.click(timeout=1000)
+                await page.keyboard.type(value, delay=20)
+                filled_count += 1
+            except Exception:
+                continue
+
+    if unfilled_required:
+        return f"requires_questionnaire ({len(unfilled_required)} unanswered: {unfilled_required[0]!r})"
+    if filled_count == 0:
+        return "no_matched_fields"
+    return "filled"
+
+
+def _llm_answer_question(question: str, profile: dict, bio: Optional[str] = None) -> Optional[str]:
+    """Use Claude Haiku to answer one host-questionnaire field."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key or not question:
+        return None
+    try:
+        import anthropic
+    except ImportError:
+        return None
+    client = anthropic.Anthropic(api_key=api_key)
+    profile_lines = "\n".join(f"  {k}: {v}" for k, v in profile.items() if v)
+    bio_line = f"\nMy bio / one-liner about me: {bio}" if bio else ""
+    prompt = (
+        f"You're filling out an event RSVP form on someone's behalf.\n\n"
+        f"Profile:\n{profile_lines}{bio_line}\n\n"
+        f"Question/field: {question!r}\n\n"
+        f"Reply with ONLY the answer text (no JSON, no prose, no quotes). "
+        f"Keep it under 100 chars. If the question is asking for something "
+        f"you don't have, give a brief honest answer."
+    )
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception:
+        return None
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    return text.strip().strip('"').strip("'")[:200] or None
+
+
 async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
                      name: Optional[str] = None, phone: Optional[str] = None,
+                     email: Optional[str] = None, linkedin: Optional[str] = None,
+                     bio: Optional[str] = None, llm_answer: bool = False,
                      debug: bool = False, timeout_ms: int = 60_000) -> tuple[str, str]:
     """RSVP to one event. If debug=True, screenshots at each stage and
     keeps the browser open longer so a human can watch."""
@@ -445,11 +568,54 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
             continue
     if debug:
         log.info("    debug: clicked_confirm=%s", clicked_confirm)
-    await page.wait_for_timeout(3_000)
+    await page.wait_for_timeout(2_500)
+
+    # Some events have a SECOND modal — host-defined questionnaire
+    # ("Questions from the hosts") with custom fields. Handle up to 3
+    # sequential modals so multi-step funnels work.
+    questionnaire_handled = False
+    questionnaire_skip_reason = None
+    for round_idx in range(3):
+        try:
+            body = (await page.inner_text("body")).lower()
+        except Exception:
+            break
+        # Heuristic for "we hit another modal that wants more answers"
+        is_questionnaire = ("questions from the hosts" in body
+                            or "tell us about yourself" in body
+                            or "answer a few questions" in body)
+        if not is_questionnaire:
+            break
+        result = await _fill_questionnaire(
+            page, name=name, phone=phone, email=email, linkedin=linkedin,
+            bio=bio, llm_answer=llm_answer, debug=debug,
+        )
+        if result == "filled":
+            questionnaire_handled = True
+            # Click Continue again to submit
+            for sel in ("button:has-text('Continue')",
+                        "[role=button]:has-text('Continue')"):
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=2_500):
+                        await loc.click(timeout=3_000)
+                        break
+                except Exception:
+                    continue
+            await page.wait_for_timeout(2_500)
+        else:
+            questionnaire_skip_reason = result
+            break
+    if debug and questionnaire_handled:
+        await page.screenshot(path="debug_04_after_questionnaire.png", full_page=True)
+
     if debug:
         await page.screenshot(path="debug_03_after_confirm.png", full_page=True)
         log.info("    debug: holding browser open for 20s for inspection")
         await page.wait_for_timeout(20_000)
+
+    if questionnaire_skip_reason:
+        return ("skip", f"{questionnaire_skip_reason} | {title[:80]}")
     try:
         post_text = (await page.inner_text("body")).lower()
         if any(t in post_text for t in ("you're going", "you're attending", "you're in",
@@ -479,6 +645,10 @@ async def cmd_rsvp(
     headed: bool = False,
     name: Optional[str] = None,
     phone: Optional[str] = None,
+    email: Optional[str] = None,
+    linkedin: Optional[str] = None,
+    bio: Optional[str] = None,
+    llm_answer: bool = False,
     debug: bool = False,
 ) -> None:
     if not async_playwright:
@@ -543,12 +713,15 @@ async def cmd_rsvp(
     if PROFILE_FILE.exists():
         try:
             saved = json.loads(PROFILE_FILE.read_text())
-            if not name and saved.get("name"):
-                name = saved["name"]
-                log.info("loaded name from %s", PROFILE_FILE)
-            if not phone and saved.get("phone"):
-                phone = saved["phone"]
-                log.info("loaded phone from %s", PROFILE_FILE)
+            for k, v in (("name", name), ("phone", phone), ("email", email),
+                         ("linkedin", linkedin), ("bio", bio)):
+                if not v and saved.get(k):
+                    log.info("loaded %s from %s", k, PROFILE_FILE)
+                    if k == "name": name = saved[k]
+                    elif k == "phone": phone = saved[k]
+                    elif k == "email": email = saved[k]
+                    elif k == "linkedin": linkedin = saved[k]
+                    elif k == "bio": bio = saved[k]
         except Exception:
             pass
 
@@ -567,9 +740,12 @@ async def cmd_rsvp(
                 phone = ext_phone
                 log.info("auto-extracted phone from login: %s", phone)
         # Persist whatever we ended up with so the next run is zero-config.
-        if name or phone:
+        if name or phone or email or linkedin or bio:
             try:
-                PROFILE_FILE.write_text(json.dumps({"name": name, "phone": phone}))
+                PROFILE_FILE.write_text(json.dumps({
+                    "name": name, "phone": phone, "email": email,
+                    "linkedin": linkedin, "bio": bio,
+                }))
             except Exception:
                 pass
         if not phone:
@@ -579,6 +755,8 @@ async def cmd_rsvp(
             log.info("[%d/%d] %s", i, len(urls), url)
             action, result = await _rsvp_one(page, url, dry_run=dry_run,
                                               name=name, phone=phone,
+                                              email=email, linkedin=linkedin,
+                                              bio=bio, llm_answer=llm_answer,
                                               debug=debug)
             w.writerow([datetime.now(timezone.utc).isoformat(), url, action, result])
             f.flush()
@@ -633,6 +811,19 @@ def main() -> None:
     rp.add_argument("--phone", type=str, default=None,
                     help="phone number for the RSVP modal (e.g. '+1 555 123 4567'). "
                          "Partiful uses this for event reminders.")
+    rp.add_argument("--email", type=str, default=None,
+                    help="email for host questionnaires that ask for one.")
+    rp.add_argument("--linkedin", type=str, default=None,
+                    help="LinkedIn URL for host questionnaires that ask for one "
+                         "(e.g. https://linkedin.com/in/danielwang).")
+    rp.add_argument("--bio", type=str, default=None,
+                    help="one-line bio used by --llm-answer to fill custom questions "
+                         "(e.g. 'CS at UWaterloo, building a partiful rsvp bot').")
+    rp.add_argument("--llm-answer", action="store_true",
+                    help="for host-questionnaire fields the bot doesn't recognize, "
+                         "use Claude Haiku to compose answers from your profile + bio. "
+                         "Requires ANTHROPIC_API_KEY. Without this, events with custom "
+                         "questions are skipped.")
     rp.add_argument("--dry-run", action="store_true", help="navigate + report, don't click")
     rp.add_argument("--headed", action="store_true", help="visible browser (debugging)")
     rp.add_argument("--debug", action="store_true",
@@ -663,6 +854,10 @@ def main() -> None:
             headed=args.headed,
             name=args.name,
             phone=args.phone,
+            email=args.email,
+            linkedin=args.linkedin,
+            bio=args.bio,
+            llm_answer=args.llm_answer,
             debug=args.debug,
         ))
 
