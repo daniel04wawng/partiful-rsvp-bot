@@ -279,12 +279,24 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     except PWTimeout:
         return ("navigate", "timeout")
+    # React/Next hydration window — without this we look for buttons before
+    # the app finishes rendering and almost always miss them.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except PWTimeout:
+        pass  # some events keep long-poll connections open; carry on
+    await page.wait_for_timeout(800)
     title = ""
     try:
         title = (await page.title()) or ""
     except Exception:
         pass
     page_text = (await page.inner_text("body")).lower()
+    # Past-event detection — Partiful removes the RSVP button after an
+    # event ends. Surface a clearer skip reason than "no button found."
+    if any(t in page_text for t in ("event ended", "event has ended",
+                                     "this event has passed", "no longer accepting")):
+        return ("skip", f"event_ended | {title[:80]}")
     if any(t in page_text for t in ("you're going", "you're attending", "you're in",
                                      "you applied", "you've applied",
                                      "application pending",

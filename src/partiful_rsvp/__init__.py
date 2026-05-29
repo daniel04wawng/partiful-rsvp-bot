@@ -1,3 +1,3 @@
 """partiful-rsvp — open-source RSVP bot for Partiful events."""
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
