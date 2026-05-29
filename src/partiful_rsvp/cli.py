@@ -454,10 +454,44 @@ def _llm_answer_question(question: str, profile: dict, bio: Optional[str] = None
     return text.strip().strip('"').strip("'")[:200] or None
 
 
+_SMS_PROMPT_TOKENS = (
+    "enter verification code",
+    "enter the verification code",
+    "enter the code we sent",
+    "we sent you a code",
+    "we sent a code",
+    "verification code",
+    "confirm your number",
+    "confirm your phone",
+    "verify your phone",
+    "verify your number",
+)
+
+
+async def _detect_sms_prompt(page: Page) -> bool:
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        return False
+    return any(t in body for t in _SMS_PROMPT_TOKENS)
+
+
+async def _wait_for_sms_resolved(page: Page, *, timeout_s: int = 90) -> bool:
+    """Poll every 2s for the SMS prompt to disappear. Returns True if it
+    resolved (user entered the code), False on timeout."""
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        if not await _detect_sms_prompt(page):
+            return True
+        await page.wait_for_timeout(2_000)
+    return False
+
+
 async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
                      name: Optional[str] = None, phone: Optional[str] = None,
                      email: Optional[str] = None, linkedin: Optional[str] = None,
                      bio: Optional[str] = None, llm_answer: bool = False,
+                     pause_for_sms: bool = False,
                      debug: bool = False, timeout_ms: int = 60_000) -> tuple[str, str]:
     """RSVP to one event. If debug=True, screenshots at each stage and
     keeps the browser open longer so a human can watch."""
@@ -633,6 +667,20 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
         log.info("    debug: clicked_confirm=%s", clicked_confirm)
     await page.wait_for_timeout(2_500)
 
+    # Partiful sometimes inserts a fresh SMS verification step here even
+    # though we're logged in. Detect and either pause for the user to type
+    # the code in the headed browser, or skip the event.
+    if await _detect_sms_prompt(page):
+        if pause_for_sms:
+            log.info("    SMS verification prompt detected — pausing 90s for you "
+                     "to type the code in the browser. Waiting...")
+            ok = await _wait_for_sms_resolved(page, timeout_s=90)
+            if not ok:
+                return ("skip", f"sms_verification_timeout | {title[:80]}")
+            log.info("    SMS resolved, continuing")
+        else:
+            return ("skip", f"requires_sms_verification | {title[:80]}")
+
     # Some events have a SECOND modal — host-defined questionnaire
     # ("Questions from the hosts") with custom fields. Handle up to 3
     # sequential modals so multi-step funnels work.
@@ -712,6 +760,7 @@ async def cmd_rsvp(
     linkedin: Optional[str] = None,
     bio: Optional[str] = None,
     llm_answer: bool = False,
+    pause_for_sms: bool = False,
     debug: bool = False,
 ) -> None:
     if not async_playwright:
@@ -820,6 +869,7 @@ async def cmd_rsvp(
                                               name=name, phone=phone,
                                               email=email, linkedin=linkedin,
                                               bio=bio, llm_answer=llm_answer,
+                                              pause_for_sms=pause_for_sms,
                                               debug=debug)
             w.writerow([datetime.now(timezone.utc).isoformat(), url, action, result])
             f.flush()
@@ -887,6 +937,11 @@ def main() -> None:
                          "use Claude Haiku to compose answers from your profile + bio. "
                          "Requires ANTHROPIC_API_KEY. Without this, events with custom "
                          "questions are skipped.")
+    rp.add_argument("--pause-for-sms", action="store_true",
+                    help="if Partiful asks for an SMS verification code mid-RSVP, "
+                         "pause up to 90s for you to type it into the browser (use "
+                         "with --headed). Without this flag, events that require "
+                         "SMS verification are skipped.")
     rp.add_argument("--dry-run", action="store_true", help="navigate + report, don't click")
     rp.add_argument("--headed", action="store_true", help="visible browser (debugging)")
     rp.add_argument("--debug", action="store_true",
@@ -921,6 +976,7 @@ def main() -> None:
             linkedin=args.linkedin,
             bio=args.bio,
             llm_answer=args.llm_answer,
+            pause_for_sms=args.pause_for_sms,
             debug=args.debug,
         ))
 
