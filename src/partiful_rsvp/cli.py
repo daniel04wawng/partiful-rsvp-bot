@@ -49,6 +49,7 @@ except ImportError:
 log = logging.getLogger("rsvp_bot")
 
 STATE_FILE = Path("partiful_state.json")
+PROFILE_FILE = Path("partiful_profile.json")
 LOG_FILE = Path("rsvp_log.csv")
 
 _PARTIFUL_URL_RE = re.compile(r"partiful\.com/e/[A-Za-z0-9]+")
@@ -459,13 +460,30 @@ async def cmd_rsvp(
         w.writerow(["timestamp", "url", "action", "result"])
     f.flush()
 
+    # Resolve name + phone in priority order:
+    #   1. --name/--phone CLI flags
+    #   2. saved partiful_profile.json from a previous run
+    #   3. auto-extract from Firebase Auth in localStorage
+    # Whatever we end up with gets written back to the profile so the next
+    # run picks it up without any flags.
+    if PROFILE_FILE.exists():
+        try:
+            saved = json.loads(PROFILE_FILE.read_text())
+            if not name and saved.get("name"):
+                name = saved["name"]
+                log.info("loaded name from %s", PROFILE_FILE)
+            if not phone and saved.get("phone"):
+                phone = saved["phone"]
+                log.info("loaded phone from %s", PROFILE_FILE)
+        except Exception:
+            pass
+
     consecutive_fail = 0
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not headed)
         context = await browser.new_context(storage_state=str(STATE_FILE))
         page = await context.new_page()
-        # Pull name + phone from the saved login session unless the user
-        # already passed them via CLI flags.
+        # Last-resort extraction from the live session.
         if not name or not phone:
             ext_name, ext_phone = await _extract_user_info(page)
             if not name and ext_name:
@@ -474,9 +492,15 @@ async def cmd_rsvp(
             if not phone and ext_phone:
                 phone = ext_phone
                 log.info("auto-extracted phone from login: %s", phone)
+        # Persist whatever we ended up with so the next run is zero-config.
+        if name or phone:
+            try:
+                PROFILE_FILE.write_text(json.dumps({"name": name, "phone": phone}))
+            except Exception:
+                pass
         if not phone:
-            log.warning("no phone found — Partiful's modal may not accept the RSVP. "
-                        "Pass --phone explicitly or re-run `partiful-rsvp login`.")
+            log.warning("no phone resolved — Partiful's modal may not accept the RSVP. "
+                        "Pass --phone explicitly once and it'll be saved for next time.")
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] %s", i, len(urls), url)
             action, result = await _rsvp_one(page, url, dry_run=dry_run,

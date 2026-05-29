@@ -1,5 +1,6 @@
 # Local Partiful login state — DO NOT commit; this is your auth
 partiful_state.json
+partiful_profile.json
 
 # Run outputs
 rsvp_log.csv
