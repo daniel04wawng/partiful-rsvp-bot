@@ -220,7 +220,9 @@ def llm_match(meta: dict, user_types: str) -> tuple[bool, str]:
 # rsvp on a single page
 # =========================================================================
 
-async def _rsvp_one(page: Page, url: str, *, dry_run: bool, timeout_ms: int = 60_000) -> tuple[str, str]:
+async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
+                     name: Optional[str] = None, phone: Optional[str] = None,
+                     timeout_ms: int = 60_000) -> tuple[str, str]:
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     except PWTimeout:
@@ -279,9 +281,44 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool, timeout_ms: int = 60
         await btn.click(timeout=5_000)
     except Exception as exc:
         return ("click", f"click_failed:{type(exc).__name__} | {title[:80]}")
-    for sel in ("button:has-text('Confirm')", "button:has-text('RSVP')",
-                "button:has-text('Submit')", "button:has-text('Done')",
-                "button:has-text('Save')", "button:has-text('Apply')"):
+
+    # Partiful opens a confirm modal with Going/Maybe/Can't Go preselected on
+    # Going, plus Name + Phone fields and a Continue button. Fill what we have.
+    await page.wait_for_timeout(800)
+    if name:
+        for sel in ("input[placeholder*='Name' i]",
+                    "input[name='name' i]",
+                    "input[aria-label*='Name' i]"):
+            try:
+                inp = page.locator(sel).first
+                if await inp.is_visible(timeout=1500):
+                    cur = (await inp.input_value()) or ""
+                    if not cur.strip():
+                        await inp.fill(name, timeout=2000)
+                    break
+            except Exception:
+                continue
+    if phone:
+        for sel in ("input[placeholder*='Phone' i]",
+                    "input[name='phone' i]",
+                    "input[aria-label*='Phone' i]",
+                    "input[type='tel']"):
+            try:
+                inp = page.locator(sel).first
+                if await inp.is_visible(timeout=1500):
+                    cur = (await inp.input_value()) or ""
+                    if not cur.strip():
+                        await inp.fill(phone, timeout=2000)
+                    break
+            except Exception:
+                continue
+
+    # Click confirm. 'Continue' is Partiful's modal-submit; the others cover
+    # variants on different event types.
+    for sel in ("button:has-text('Continue')", "button:has-text('Confirm')",
+                "button:has-text('RSVP')", "button:has-text('Submit')",
+                "button:has-text('Done')", "button:has-text('Save')",
+                "button:has-text('Apply')"):
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=2_500):
@@ -289,7 +326,7 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool, timeout_ms: int = 60
                 break
         except Exception:
             continue
-    await page.wait_for_timeout(2_000)
+    await page.wait_for_timeout(2_500)
     try:
         post_text = (await page.inner_text("body")).lower()
         if any(t in post_text for t in ("you're going", "you're attending", "you're in",
@@ -317,6 +354,8 @@ async def cmd_rsvp(
     max_events: Optional[int] = None,
     dry_run: bool = False,
     headed: bool = False,
+    name: Optional[str] = None,
+    phone: Optional[str] = None,
 ) -> None:
     if not async_playwright:
         log.error("playwright not installed")
@@ -378,7 +417,8 @@ async def cmd_rsvp(
         page = await context.new_page()
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] %s", i, len(urls), url)
-            action, result = await _rsvp_one(page, url, dry_run=dry_run)
+            action, result = await _rsvp_one(page, url, dry_run=dry_run,
+                                              name=name, phone=phone)
             w.writerow([datetime.now(timezone.utc).isoformat(), url, action, result])
             f.flush()
             log.info("    %s | %s", action, result)
@@ -426,6 +466,12 @@ def main() -> None:
     rp.add_argument("--delay", type=float, default=30.0, help="base seconds between RSVPs")
     rp.add_argument("--jitter", type=float, default=30.0, help="random extra seconds")
     rp.add_argument("--max", type=int, default=None, help="optional cap on events this run")
+    rp.add_argument("--name", type=str, default=None,
+                    help="name to fill in Partiful's RSVP modal if it asks. "
+                         "Use the same name on your Partiful account.")
+    rp.add_argument("--phone", type=str, default=None,
+                    help="phone number for the RSVP modal (e.g. '+1 555 123 4567'). "
+                         "Partiful uses this for event reminders.")
     rp.add_argument("--dry-run", action="store_true", help="navigate + report, don't click")
     rp.add_argument("--headed", action="store_true", help="visible browser (debugging)")
     rp.add_argument("--quiet", action="store_true")
@@ -450,6 +496,8 @@ def main() -> None:
             max_events=args.max,
             dry_run=args.dry_run,
             headed=args.headed,
+            name=args.name,
+            phone=args.phone,
         ))
 
 
