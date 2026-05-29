@@ -1,0 +1,19 @@
+# Local Partiful login state — DO NOT commit; this is your auth
+partiful_state.json
+
+# Run outputs
+rsvp_log.csv
+rsvp_filtered.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
