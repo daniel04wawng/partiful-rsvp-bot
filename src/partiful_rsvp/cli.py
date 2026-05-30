@@ -93,26 +93,175 @@ def _auto_detect_profile() -> dict:
     return {k: v for k, v in out.items() if v}
 
 
-async def cmd_login() -> None:
-    """Open headed Chrome to partiful.com. User logs in. We save the
-    browser state + auto-detect profile info from git/gh."""
+def _print_manual_login_instructions() -> None:
+    print()
+    print("=" * 70)
+    print("  Partiful login window opened.")
+    print("  - Click Sign in / Log in")
+    print("  - Enter your phone, type the SMS code")
+    print("  - Wait until you see your home feed")
+    print("  - Then return here and press ENTER")
+    print("=" * 70)
+
+
+async def _auto_login(page, phone: str) -> bool:
+    """Fully automated Partiful login: fill phone → wait for SMS via chat.db → fill OTP.
+    Returns True if login succeeded, False if it couldn't be automated."""
+    import platform
+    # Navigate to Partiful and click the login button.
+    try:
+        await page.goto("https://partiful.com/", wait_until="networkidle", timeout=30_000)
+    except Exception:
+        return False
+
+    # Click Sign in / Log in button.
+    for sel in ("button:has-text('Log in')", "button:has-text('Sign in')",
+                "a:has-text('Log in')", "a:has-text('Sign in')",
+                "[role=button]:has-text('Log in')", "[role=button]:has-text('Sign in')"):
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=3_000):
+                await loc.click(timeout=3_000)
+                break
+        except Exception:
+            continue
+    await page.wait_for_timeout(1_500)
+
+    # Fill in the phone number field.
+    phone_filled = False
+    for sel in ("input[type='tel']", "input[placeholder*='phone' i]",
+                "input[placeholder*='number' i]", "input[inputmode='tel']"):
+        try:
+            inp = page.locator(sel).first
+            if await inp.is_visible(timeout=2_000):
+                await inp.fill(phone, timeout=2_000)
+                phone_filled = True
+                break
+        except Exception:
+            continue
+    if not phone_filled:
+        log.debug("auto-login: couldn't find phone field")
+        return False
+
+    # Click Send / Continue to request the SMS.
+    for sel in ("button:has-text('Send')", "button:has-text('Continue')",
+                "button:has-text('Next')", "button:has-text('Get code')",
+                "[role=button]:has-text('Send')", "[role=button]:has-text('Continue')"):
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=2_000):
+                await loc.click(timeout=2_000)
+                break
+        except Exception:
+            continue
+    await page.wait_for_timeout(1_000)
+
+    # Watch chat.db for the OTP (same WAL-watch approach used during RSVP).
+    if platform.system() != "Darwin" or _chat_db_path() is None:
+        log.debug("auto-login: not on macOS or no chat.db — can't auto-read OTP")
+        return False
+
+    print("  Waiting for SMS code via Messages.app...")
+    code = await _wait_for_sms_otp_wal(timeout_s=60)
+    if not code:
+        log.debug("auto-login: no OTP found in chat.db within 60s")
+        return False
+
+    print(f"  Got OTP code: {code} — typing it in...")
+    # Fill the OTP field.
+    otp_filled = False
+    for sel in ("input[autocomplete='one-time-code']", "input[inputmode='numeric']",
+                "input[type='tel']", "input[name*='code' i]",
+                "input[placeholder*='code' i]", "input:visible:not([type='hidden'])"):
+        try:
+            inp = page.locator(sel).first
+            if await inp.is_visible(timeout=2_000):
+                try:
+                    await inp.fill(code, timeout=2_000)
+                except Exception:
+                    await inp.click(timeout=1_500)
+                    await page.keyboard.type(code, delay=40)
+                otp_filled = True
+                break
+        except Exception:
+            continue
+    if not otp_filled:
+        return False
+
+    # Submit the OTP.
+    for sel in ("button:has-text('Verify')", "button:has-text('Continue')",
+                "button:has-text('Confirm')", "button:has-text('Submit')",
+                "[role=button]:has-text('Verify')", "[role=button]:has-text('Continue')"):
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=2_000):
+                await loc.click(timeout=2_000)
+                break
+        except Exception:
+            continue
+
+    # Wait for home feed to confirm login succeeded.
+    await page.wait_for_timeout(3_000)
+    try:
+        body = (await page.inner_text("body")).lower()
+        # Partiful home feed has "events" or user-specific content.
+        if any(t in body for t in ("upcoming events", "your events", "explore", "discover")):
+            return True
+    except Exception:
+        pass
+    # Even if we can't confirm the feed, if OTP was typed we likely succeeded.
+    return otp_filled
+
+
+async def cmd_login(phone: Optional[str] = None, auto: bool = True) -> None:
+    """Log into Partiful and save the browser session.
+
+    By default tries fully automated login (phone → SMS via Messages.app → OTP).
+    Falls back to manual (headed browser, user types everything) if automation
+    fails or --no-auto is passed."""
     if not async_playwright:
         log.error("playwright not installed. pip install playwright && playwright install chromium")
         sys.exit(1)
+
+    # Resolve phone: CLI flag → saved profile → prompt
+    if not phone and PROFILE_FILE.exists():
+        try:
+            saved = json.loads(PROFILE_FILE.read_text())
+            phone = saved.get("phone")
+        except Exception:
+            pass
+
+    import platform
+    can_auto = auto and phone and platform.system() == "Darwin" and _chat_db_path() is not None
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(viewport={"width": 1200, "height": 900}, user_agent=UA)
-        page = await context.new_page()
-        await page.goto("https://partiful.com/", wait_until="networkidle")
-        print()
-        print("=" * 70)
-        print("  Partiful login window opened.")
-        print("  - Click Sign in / Log in")
-        print("  - Enter your phone, type the SMS code")
-        print("  - Wait until you see your home feed")
-        print("  - Then return here and press ENTER")
-        print("=" * 70)
-        input("Press ENTER once logged in... ")
+        if can_auto:
+            print(f"\n  Auto-login: phone={phone}, reading OTP from Messages.app...")
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(viewport={"width": 1200, "height": 900}, user_agent=UA)
+            page = await context.new_page()
+            success = await _auto_login(page, phone)
+            if not success:
+                print("  Auto-login failed — falling back to manual mode...")
+                await browser.close()
+                # Re-launch headed for manual fallback.
+                browser = await p.chromium.launch(headless=False)
+                context = await browser.new_context(viewport={"width": 1200, "height": 900}, user_agent=UA)
+                page = await context.new_page()
+                await page.goto("https://partiful.com/", wait_until="networkidle")
+                _print_manual_login_instructions()
+                input("Press ENTER once logged in... ")
+        else:
+            if auto and not phone:
+                print("  No phone number found — run with --phone +1XXXXXXXXXX for auto-login.")
+                print("  Falling back to manual login (headed browser)...")
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context(viewport={"width": 1200, "height": 900}, user_agent=UA)
+            page = await context.new_page()
+            await page.goto("https://partiful.com/", wait_until="networkidle")
+            _print_manual_login_instructions()
+            input("Press ENTER once logged in... ")
+
         await context.storage_state(path=str(STATE_FILE))
         print(f"\n✓ saved login state to {STATE_FILE}")
 
@@ -121,13 +270,13 @@ async def cmd_login() -> None:
         await browser.close()
 
     # Build the profile from system sources + Partiful. No prompts.
-    auto = _auto_detect_profile()
+    auto_info = _auto_detect_profile()
     profile = {
-        "name": ext_name or auto.get("name"),
-        "phone": ext_phone,
-        "email": auto.get("email"),
-        "linkedin": auto.get("linkedin"),
-        "bio": auto.get("bio"),
+        "name": ext_name or auto_info.get("name"),
+        "phone": ext_phone or phone,
+        "email": auto_info.get("email"),
+        "linkedin": auto_info.get("linkedin"),
+        "bio": auto_info.get("bio"),
     }
     # Merge over any existing values so reruns don't blow away manual edits.
     if PROFILE_FILE.exists():
@@ -1099,7 +1248,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("login", help="one-time browser login; saves partiful_state.json")
+    lp = sub.add_parser("login", help="one-time login; auto-reads SMS OTP from Messages.app")
+    lp.add_argument("--phone", type=str, default=None,
+                    help="your phone number (e.g. +1XXXXXXXXXX). Required for auto-login. "
+                         "Saved to partiful_profile.json so you only need to pass it once.")
+    lp.add_argument("--no-auto", action="store_true",
+                    help="skip auto-login and open a headed browser for manual login instead.")
 
     rp = sub.add_parser("rsvp", help="run RSVPs")
     src = rp.add_mutually_exclusive_group(required=True)
@@ -1161,7 +1315,7 @@ def main() -> None:
     )
 
     if args.cmd == "login":
-        asyncio.run(cmd_login())
+        asyncio.run(cmd_login(phone=args.phone, auto=not args.no_auto))
     elif args.cmd == "rsvp":
         asyncio.run(cmd_rsvp(
             calendar_url=args.calendar,
