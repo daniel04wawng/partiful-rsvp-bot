@@ -457,30 +457,65 @@ def _llm_answer_question(question: str, profile: dict, bio: Optional[str] = None
 _OTP_CODE_RE = re.compile(r"\b(\d{4,8})\b")
 
 
-def _read_recent_sms_otp(window_seconds: int = 120) -> Optional[str]:
-    """Read the most recent incoming SMS from macOS Messages.app and pull
-    a 4-8 digit OTP code from it.
-
-    Uses ~/Library/Messages/chat.db (Apple stores SMS forwarded from your
-    phone here when you're signed into iMessage on this Mac). Requires
-    Full Disk Access permission for the parent process. Returns None on
-    permission error, missing DB, no recent messages, or no code found.
-
-    This is the same approach Photon Spectrum and similar tools use to
-    consume iMessage events on Mac — there's no public Apple API for
-    third-party SMS reading."""
-    import sqlite3
+def _chat_db_path() -> Optional[Path]:
     import platform
     if platform.system() != "Darwin":
         return None
     db = Path.home() / "Library/Messages/chat.db"
-    if not db.exists():
-        return None
+    return db if db.exists() else None
+
+
+def _read_sms_otp_since_rowid(db: Path, since_rowid: int) -> tuple[Optional[str], int]:
+    """Query chat.db for incoming messages with rowid > since_rowid.
+    Returns (otp_code_or_None, new_max_rowid).
+
+    Photon's imessage-kit uses the same rowid-bookmark approach — it avoids
+    the time-window guessing problem (the `date` column uses Mac Absolute Time
+    in nanoseconds, which requires epoch math; rowid is simpler and exact)."""
+    import sqlite3
     try:
-        # Mac Absolute Time: seconds since 2001-01-01. chat.db stores
-        # date as nanoseconds in the newer schema, seconds in the older.
-        # The 1e9 boundary distinguishes them.
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        # Get the highest rowid we've seen so far (for bookmarking).
+        (max_rowid,) = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM message").fetchone()
+        if max_rowid <= since_rowid:
+            return None, since_rowid
+        cur = conn.execute(
+            "SELECT text FROM message "
+            "WHERE rowid > ? AND is_from_me = 0 AND text IS NOT NULL "
+            "ORDER BY rowid DESC LIMIT 5",
+            (since_rowid,),
+        )
+        for (text,) in cur.fetchall():
+            if not text:
+                continue
+            for m in _OTP_CODE_RE.finditer(text):
+                code = m.group(1)
+                if 4 <= len(code) <= 8:
+                    return code, max_rowid
+        return None, max_rowid
+    except sqlite3.OperationalError as exc:
+        log.debug("chat.db read failed: %s", exc)
+        return None, since_rowid
+    except Exception as exc:
+        log.debug("chat.db unexpected error: %s", exc)
+        return None, since_rowid
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _read_recent_sms_otp(window_seconds: int = 120) -> Optional[str]:
+    """Legacy time-window OTP reader. Used as a one-shot check (no bookmark).
+    Kept for backwards compatibility with callers that don't hold state."""
+    db = _chat_db_path()
+    if db is None:
+        return None
+    import sqlite3
+    try:
         import time
+        # Mac Absolute Time epoch: 2001-01-01. chat.db stores nanoseconds.
         mac_now_ns = (time.time() - 978_307_200) * 1_000_000_000
         cutoff_ns = mac_now_ns - (window_seconds * 1_000_000_000)
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
@@ -493,14 +528,12 @@ def _read_recent_sms_otp(window_seconds: int = 120) -> Optional[str]:
         for (text,) in cur.fetchall():
             if not text:
                 continue
-            # Prefer codes that look like OTPs (4-8 digits, isolated).
             for m in _OTP_CODE_RE.finditer(text):
                 code = m.group(1)
                 if 4 <= len(code) <= 8:
                     return code
         return None
     except sqlite3.OperationalError as exc:
-        # Most common error: "authorization denied" — need Full Disk Access.
         log.debug("chat.db read failed: %s", exc)
         return None
     except Exception as exc:
@@ -511,6 +544,63 @@ def _read_recent_sms_otp(window_seconds: int = 120) -> Optional[str]:
             conn.close()
         except Exception:
             pass
+
+
+async def _wait_for_sms_otp_wal(timeout_s: int = 60) -> Optional[str]:
+    """WAL-watch OTP reader — the same approach Photon's imessage-kit uses.
+
+    Instead of sleeping N seconds between polls, we watch the SQLite WAL file
+    (chat.db-wal) for mtime changes. SQLite writes to the WAL before every
+    commit, so a mtime bump = new message committed. We check every 0.5s for
+    a WAL change, then query with a rowid bookmark (no epoch math needed).
+
+    This gives ~instant OTP detection (0-0.5s lag) vs the old 3s-sleep loop.
+    Falls back to time-window polling if the WAL file doesn't exist (first
+    launch, or system just checkpointed and WAL was deleted)."""
+    db = _chat_db_path()
+    if db is None:
+        return None
+
+    wal = Path(str(db) + "-wal")
+    import sqlite3
+
+    # Snapshot the current max rowid so we only look at new rows.
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        (since_rowid,) = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM message").fetchone()
+        conn.close()
+    except Exception:
+        since_rowid = 0
+
+    # Snapshot WAL mtime so we know when it changes.
+    try:
+        last_wal_mtime = wal.stat().st_mtime if wal.exists() else 0.0
+    except Exception:
+        last_wal_mtime = 0.0
+
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+
+        # Check if WAL mtime changed (new SQLite commit → new message possible).
+        try:
+            cur_mtime = wal.stat().st_mtime if wal.exists() else last_wal_mtime
+        except Exception:
+            cur_mtime = last_wal_mtime
+
+        if cur_mtime != last_wal_mtime:
+            last_wal_mtime = cur_mtime
+            code, since_rowid = _read_sms_otp_since_rowid(db, since_rowid)
+            if code:
+                return code
+        # Even without a WAL change, poll the DB every 5s as a fallback
+        # (covers the case where WAL was checkpointed and deleted).
+        elif int(asyncio.get_event_loop().time()) % 5 == 0:
+            code, since_rowid = _read_sms_otp_since_rowid(db, since_rowid)
+            if code:
+                return code
+
+    return None
 
 
 _SMS_PROMPT_TOKENS = (
@@ -734,12 +824,9 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
     if await _detect_sms_prompt(page):
         handled = False
         if auto_sms:
-            log.info("    SMS prompt detected — polling Messages.app for OTP code...")
-            for attempt in range(20):  # up to ~60s
-                await page.wait_for_timeout(3_000)
-                code = _read_recent_sms_otp(window_seconds=180)
-                if not code:
-                    continue
+            log.info("    SMS prompt detected — watching Messages.app for OTP code (WAL watch)...")
+            code = await _wait_for_sms_otp_wal(timeout_s=60)
+            if code:
                 log.info("    found OTP code %s — typing into verification field", code)
                 # Find the most likely OTP input field and fill it
                 typed = False
@@ -778,7 +865,6 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
                     if not await _detect_sms_prompt(page):
                         handled = True
                         log.info("    SMS verified, continuing")
-                        break
         if not handled and pause_for_sms:
             log.info("    SMS verification prompt — pausing 90s for you to type "
                      "the code in the browser. Waiting...")
